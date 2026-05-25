@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            extra_platform: darwin
+            extra_arch: arm64
+            bundles: app,dmg
+          - label: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extra_platform: linux
+            extra_arch: x64
+            bundles: deb,appimage
+          - label: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extra_platform: linux
+            extra_arch: arm64
+            bundles: deb,appimage
+          - label: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            extra_platform: win32
+            extra_arch: x64
+            bundles: nsis
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Linux host dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            patchelf \
+            pkg-config \
+            wget \
+            xdg-utils
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust
+        run: |
+          rustup set profile minimal
+          rustup update stable
+          rustup default stable
+
+      - name: Setup Rust target toolchain
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify bundled engine exists
+        shell: bash
+        run: |
+          engine_dir="src-tauri/extra/${{ matrix.extra_platform }}/${{ matrix.extra_arch }}/engine"
+          [ -f "$engine_dir/aria2.conf" ]
+          if [ "${{ matrix.extra_platform }}" = "win32" ]; then
+            [ -f "$engine_dir/aria2c.exe" ]
+          else
+            [ -x "$engine_dir/aria2c" ]
+          fi
+
+      - name: Prepare release metadata
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          EXTRA_PLATFORM: ${{ matrix.extra_platform }}
+          EXTRA_ARCH: ${{ matrix.extra_arch }}
+        run: node scripts/prepare-release-metadata.mjs
+
+      - name: Build and upload release assets
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Motrix ${{ github.ref_name }}"
+          releaseBody: "See the assets for platform-specific installers."
+          releaseDraft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          includeUpdaterJson: false
+          tauriScript: bun tauri
+          args: "--target ${{ matrix.target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.release.conf.json"
+          retryAttempts: 3
+          assetNamePattern: "Motrix_[version]_${{ matrix.label }}[setup][ext]"
